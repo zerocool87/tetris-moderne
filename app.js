@@ -49,6 +49,7 @@ const TetrisGame = () => {
     let ghostY = position.y;
     while (!checkCollision({ x: position.x, y: ghostY + 1 }, currentPiece.matrix)) {
       ghostY++;
+      if (ghostY > BOARD_HEIGHT) break;
     }
     return ghostY;
   }, [currentPiece, position]);
@@ -67,7 +68,23 @@ const TetrisGame = () => {
     return false;
   }, [board]);
 
+  // helper to check collision against a provided board matrix (used for atomic operations)
+  const checkCollisionWithBoard = (boardMatrix, pos, matrix) => {
+    for (let y = 0; y < matrix.length; y++) {
+      for (let x = 0; x < matrix[y].length; x++) {
+        if (matrix[y][x]) {
+          const newX = pos.x + x;
+          const newY = pos.y + y;
+          if (newX < 0 || newX >= BOARD_WIDTH || newY >= BOARD_HEIGHT) return true;
+          if (newY >= 0 && boardMatrix[newY][newX]) return true;
+        }
+      }
+    }
+    return false;
+  };
+
   const rotate = useCallback((matrix) => {
+    if (!matrix || !matrix[0]) return matrix;
     const rotated = matrix[0].map((_, i) => matrix.map(row => row[i]).reverse());
     return rotated;
   }, []);
@@ -79,7 +96,7 @@ const TetrisGame = () => {
         if (cell) {
           const boardY = position.y + y;
           const boardX = position.x + x;
-          if (boardY >= 0) {
+          if (boardY >= 0 && boardY < BOARD_HEIGHT && boardX >= 0 && boardX < BOARD_WIDTH) {
             newBoard[boardY][boardX] = currentPiece.shape;
           }
         }
@@ -91,51 +108,62 @@ const TetrisGame = () => {
   const clearLines = useCallback((newBoard) => {
     let linesCleared = 0;
     const clearedBoard = [];
-    
+    const addedParticles = [];
+
     for (let y = BOARD_HEIGHT - 1; y >= 0; y--) {
       if (newBoard[y].every(cell => cell !== null)) {
         linesCleared++;
-        // Create particles for cleared line
+        // collect particles for cleared line
         for (let x = 0; x < BOARD_WIDTH; x++) {
-          setParticles(prev => [...prev, { x, y, id: Math.random() }]);
+          addedParticles.push({ x, y, id: Math.random() });
         }
       } else {
         clearedBoard.unshift(newBoard[y]);
       }
     }
-    
+
     while (clearedBoard.length < BOARD_HEIGHT) {
       clearedBoard.unshift(Array(BOARD_WIDTH).fill(null));
     }
-    
+
+    if (addedParticles.length > 0) {
+      setParticles(prev => [...prev, ...addedParticles]);
+    }
+
     if (linesCleared > 0) {
+      // score by current level (before potential level-up)
       const points = [0, 100, 300, 500, 800][linesCleared] * level;
       setScore(prev => prev + points);
-      setLines(prev => prev + linesCleared);
-      setLevel(Math.floor(lines / 10) + 1);
-      
+
+      // update lines and level together to avoid stale reads
+      setLines(prevLines => {
+        const updated = prevLines + linesCleared;
+        setLevel(Math.floor(updated / 10) + 1);
+        return updated;
+      });
+
       setTimeout(() => setParticles([]), 500);
     }
-    
+
     return clearedBoard;
-  }, [level, lines]);
+  }, [level]);
 
   const moveDown = useCallback(() => {
     if (!currentPiece || paused || gameOver) return;
-    
+
     const newPos = { x: position.x, y: position.y + 1 };
-    
+
     if (!checkCollision(newPos, currentPiece.matrix)) {
       setPosition(newPos);
     } else {
       const mergedBoard = mergePiece();
       const clearedBoard = clearLines(mergedBoard);
       setBoard(clearedBoard);
-      
+
       const newPiece = nextPiece || createPiece();
-      const startPos = { x: Math.floor(BOARD_WIDTH / 2) - 1, y: 0 };
-      
-      if (checkCollision(startPos, newPiece.matrix)) {
+      const startPos = { x: Math.floor((BOARD_WIDTH - newPiece.matrix[0].length) / 2), y: 0 };
+
+      if (checkCollisionWithBoard(clearedBoard, startPos, newPiece.matrix)) {
         setGameOver(true);
       } else {
         setCurrentPiece(newPiece);
@@ -164,14 +192,42 @@ const TetrisGame = () => {
   const hardDrop = useCallback(() => {
     if (!currentPiece || paused || gameOver) return;
     const ghostY = getGhostPosition();
-    setPosition({ ...position, y: ghostY });
-    setTimeout(moveDown, 50);
-  }, [currentPiece, paused, gameOver, getGhostPosition, position, moveDown]);
+    if (ghostY === null || ghostY === undefined) return;
+
+    // build merged board locally (avoid relying on async setBoard)
+    const mergedBoard = board.map(row => [...row]);
+    currentPiece.matrix.forEach((row, ry) => {
+      row.forEach((cell, rx) => {
+        if (cell) {
+          const by = ghostY + ry;
+          const bx = position.x + rx;
+          if (by >= 0 && by < BOARD_HEIGHT && bx >= 0 && bx < BOARD_WIDTH) {
+            mergedBoard[by][bx] = currentPiece.shape;
+          }
+        }
+      });
+    });
+
+    const clearedBoard = clearLines(mergedBoard);
+    setBoard(clearedBoard);
+
+    // spawn next piece based on clearedBoard (not on stale state)
+    const newPiece = nextPiece || createPiece();
+    const startPos = { x: Math.floor((BOARD_WIDTH - newPiece.matrix[0].length) / 2), y: 0 };
+
+    if (checkCollisionWithBoard(clearedBoard, startPos, newPiece.matrix)) {
+      setGameOver(true);
+    } else {
+      setCurrentPiece(newPiece);
+      setNextPiece(createPiece());
+      setPosition(startPos);
+    }
+  }, [currentPiece, paused, gameOver, getGhostPosition, position, board, nextPiece, createPiece, clearLines]);
 
   useEffect(() => {
     const handleKeyPress = (e) => {
       if (gameOver) return;
-      
+
       switch(e.key) {
         case 'ArrowLeft':
           e.preventDefault();
@@ -199,7 +255,7 @@ const TetrisGame = () => {
           break;
       }
     };
-    
+
     window.addEventListener('keydown', handleKeyPress);
     return () => window.removeEventListener('keydown', handleKeyPress);
   }, [moveHorizontal, moveDown, rotatePiece, hardDrop, gameOver]);
@@ -209,7 +265,7 @@ const TetrisGame = () => {
       const newPiece = createPiece();
       setCurrentPiece(newPiece);
       setNextPiece(createPiece());
-      setPosition({ x: Math.floor(BOARD_WIDTH / 2) - 1, y: 0 });
+      setPosition({ x: Math.floor((BOARD_WIDTH - newPiece.matrix[0].length) / 2), y: 0 });
     }
   }, [currentPiece, gameOver, createPiece]);
 
@@ -218,10 +274,10 @@ const TetrisGame = () => {
       if (gameLoopRef.current) clearInterval(gameLoopRef.current);
       return;
     }
-    
+
     const speed = Math.max(100, 1000 - (level - 1) * 50);
     gameLoopRef.current = setInterval(moveDown, speed);
-    
+
     return () => {
       if (gameLoopRef.current) clearInterval(gameLoopRef.current);
     };
@@ -243,7 +299,7 @@ const TetrisGame = () => {
   const renderCell = (cell, x, y, isGhost = false) => {
     const color = cell ? COLORS[cell] : 'from-gray-800 to-gray-900';
     const opacity = isGhost ? 'opacity-30' : 'opacity-100';
-    
+
     return (
       <div
         key={`${x}-${y}`}
@@ -274,7 +330,7 @@ const TetrisGame = () => {
                 row.map((cell, x) => {
                   let displayCell = cell;
                   let isGhost = false;
-                  
+
                   if (currentPiece) {
                     currentPiece.matrix.forEach((pieceRow, py) => {
                       pieceRow.forEach((pieceCell, px) => {
@@ -290,12 +346,12 @@ const TetrisGame = () => {
                       });
                     });
                   }
-                  
+
                   return renderCell(displayCell, x, y, isGhost);
                 })
               )}
             </div>
-            
+
             {/* Particles */}
             {particles.map(particle => (
               <div
@@ -307,7 +363,7 @@ const TetrisGame = () => {
                 }}
               />
             ))}
-            
+
             {/* Pause/Game Over Overlay */}
             {(paused || gameOver) && (
               <div className="absolute inset-0 bg-black/80 flex items-center justify-center rounded-lg">
@@ -400,10 +456,10 @@ const TetrisGame = () => {
             <button
               onClick={() => setPaused(!paused)}
               disabled={gameOver}
-              className="mt-4 w-full px-4 py-2 bg-gradient-to-r from-blue-500 to-purple-500 text-white rounded-lg font-bold hover:from-blue-600 hover:to-purple-600 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+              className="mt-4 w-full px-4 py-2 bg-gradient-to-r from-blue-500 to-purple-500 text-white rounded-lg font-bold hover:from-blue-600 hover:to-purple-600 transition-all disabled:opacity-50 flex items-center justify-center gap-2"
             >
               {paused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
-              {paused ? 'Reprendre' : 'Pause'}
+              <span>{paused ? 'Reprendre' : 'Pause'}</span>
             </button>
           </div>
         </div>
